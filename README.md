@@ -29,6 +29,8 @@ guesswork:
 | "Optimize this" produces vague advice | `optimize` emits evidence, exact change, expected gain, risk and a verification command |
 | Agents guess at CLI output | every command has a stable `{ ok, result, error, meta }` JSON envelope |
 
+**Using a coding agent?** Read **[AGENTIC.md](AGENTIC.md)** for the full operating contract, or let your agent auto-load **[AGENTS.md](AGENTS.md)**.
+
 **Design principles**
 
 - **No orchestration of unknown tools.** Missing tools are skipped with a reason,
@@ -125,6 +127,94 @@ A single task in `AGENT_TASK.md` looks like:
 
 ---
 
+## Agentic coding: make your agent use codesafe
+
+codesafe is designed to sit underneath any coding agent (Claude Code, Codex,
+Cursor, OpenCode, Cline, Aider, a custom harness, or a CI bot) and be the
+**verification layer** it cannot bypass.
+
+Two files define the contract:
+
+| File | Purpose |
+|---|---|
+| **`AGENTIC.md`** | Full operating manual: loop, prompt templates, JSON recipes, anti-gaming policy, long-running protocol, recovery table |
+| **`AGENTS.md`** | Short auto-loaded contract: commands, boundaries, definition of done |
+
+### 1. Load the contract
+
+Add this to your agent's project instructions, or point the agent at
+`AGENTIC.md`:
+
+```text
+Use codesafe as the verification layer. Start with `codesafe brief <repo>`.
+Make the smallest scoped change. Never weaken/skip/delete tests, hard-code
+test inputs, or mock the unit under test. Before reporting done, run
+`codesafe test --fail-on warning <repo>` and `codesafe verify <repo>`, then
+re-run `codesafe brief <repo>` and confirm the task disappeared. If it did
+not, report the blocker instead of claiming success.
+```
+
+### 2. Give the agent one loop
+
+```bash
+codesafe brief <repo> --output json     # 1. where is the bug, what does it affect, how to fix it
+# 2. agent confirms the snippet and applies the smallest change
+codesafe fix --dry-run <repo>           # 3. see whether a safe automated fix exists
+codesafe test --fail-on warning <repo>  # 4. build + tests + lint + fuzz
+codesafe verify <repo>                  # 5. anti-gaming gate must be clean
+codesafe brief <repo>                   # 6. the task must disappear
+```
+
+The brief gives the model information it would otherwise have to guess:
+
+- **where** — folder, file, line, enclosing symbol, numbered snippet
+- **what** — affected area, imports, module summary, evidence
+- **why** — root-cause hypothesis and impact
+- **how** — fix plan, safe fix, exact verification commands, risks
+- **when done** — a definition of done that cannot be satisfied by editing tests
+
+### 3. Use the task packet, not a vague prompt
+
+```bash
+codesafe brief . --output json   | jq -r '.result.tasks[0] | "\(.severity) \(.file):\(.line) \(.symbol) — \(.symptom)"'
+```
+
+Then paste the task's `code_snippet`, `fix_plan` and `verification` into the
+agent prompt. This keeps the agent anchored to the real location instead of
+re-reading the repository or inventing one.
+
+### 4. Non-negotiables (machine-enforced)
+
+`codesafe verify` rejects tautological assertions, mocking the unit under test,
+removed/weakened assertions, new skips/xfails, out-of-scope edits and
+scoped-pass/full-fail. If a test is wrong, the agent must **stop and explain**,
+not edit it.
+
+### 5. Long-running agents
+
+- one task per iteration
+- commit after each verified task
+- keep `.codesafe/progress.md` with what changed, what passed, what blocks
+- start each session with `AGENTIC.md`, `codesafe brief`, and `git log`
+- never leave background polling loops running between turns
+
+Full details, prompt templates, JSON recipes and a failure-recovery table:
+**[AGENTIC.md](AGENTIC.md)** · **[AGENTS.md](AGENTS.md)**.
+
+### 6. Tool integration
+
+```bash
+codesafe schema --output json          # command/flag schema
+codesafe generate-skill --output json  # LLM tool-definition document
+```
+
+Test the instruction path with a small reversible task: does the agent load the
+contract, keep the diff scoped, run verification, and regenerate the brief
+before declaring completion? Update `AGENTIC.md` from real failures, not
+hypothetical ones.
+
+---
+
 ## Commands
 
 | Command | What it does |
@@ -164,7 +254,7 @@ A single task in `AGENT_TASK.md` looks like:
 
 ---
 
-## The agent workflow
+## Agent workflow (visual)
 
 ```
           ┌──────────────┐
