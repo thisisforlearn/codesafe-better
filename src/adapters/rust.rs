@@ -41,7 +41,7 @@ impl LanguageAdapter for Rust {
             return run_command(
                 ctx.path,
                 "cargo",
-                &["clippy", "--all-targets"],
+                &["clippy", "--all-targets", "--message-format=json"],
                 ctx.timeout_s,
             );
         }
@@ -83,24 +83,11 @@ fn skipped(tool: &str) -> ToolResult {
 }
 
 fn has_rust_files(path: &Path) -> bool {
-    !find_files_by_ext(path, &["rs"]).is_empty()
+    crate::scan::has_files_with_ext(path, &["rs"])
 }
 
 fn find_files_by_ext(path: &Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| !crate::scan::is_ignored_dir(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            let ext = e.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-            if exts.contains(&ext) {
-                Some(e.path().to_path_buf())
-            } else {
-                None
-            }
-        })
-        .collect()
+    crate::scan::files_with_ext(path, exts)
 }
 
 fn has_proptest(path: &Path) -> bool {
@@ -155,19 +142,9 @@ fn parse_criterion_line(line: &str) -> Option<BenchmarkResult> {
 
 /// Profile via perf if available; otherwise no hotspots (clear note is reported elsewhere).
 fn profile_rust(ctx: Context<'_>) -> Result<Vec<Hotspot>> {
-    if require_tool("perf")?.skipped {
-        return Ok(vec![]);
-    }
-    // Sampling the test suite for a few seconds gives representative hotspots.
-    let output = run_command(
-        ctx.path,
-        "perf",
-        &["record", "-e", "cycles", "-a", "--", "cargo", "test"],
-        None,
-    )?;
-    let _ = output;
-    // perf report parsing is heavy; return empty and let the report note the raw perf.data.
-    Ok(vec![])
+    // Sampling the test suite gives representative hotspots. perf failures
+    // (permissions/kernel settings) yield an empty list, not an error.
+    crate::adapters::perf_hotspots(ctx.path, &["cargo", "test"], ctx.timeout_s)
 }
 
 /// Safe fixes: apply each safe Rust rule's action (e.g. cargo fmt / cargo clippy --fix).

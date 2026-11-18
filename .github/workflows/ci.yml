@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test --all-targets
+      - name: Smoke test CLI (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cargo run --quiet -- scan fixtures/python/buggy_pkg
+          cargo run --quiet -- --output json schema > /tmp/schema.json
+          python3 -c "import json; json.load(open('/tmp/schema.json'))"
+          cargo run --quiet -- optimize fixtures/python/buggy_pkg
+          cargo run --quiet -- cover fixtures/python/buggy_pkg
+          cargo run --quiet -- brief fixtures/python/buggy_pkg > /dev/null
+          test -f fixtures/python/buggy_pkg/AGENT_TASK.md
+
+  test-guard:
+    name: test guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail on new skips/xfails in tests
+        run: |
+          base="origin/${{ github.base_ref }}"
+          if git diff -U0 "$base"...HEAD -- 'tests/**' | grep -E '^\+.*(pytest\.mark\.(skip|xfail)|#\[ignore\]|it\.skip\(|xit\()'; then
+            echo "::error::New skipped/xfailed test added. Fix the implementation or explain the skip in review."
+            exit 1
+          fi
+      - name: Warn when tests change
+        run: |
+          base="origin/${{ github.base_ref }}"
+          changed=$(git diff --name-only "$base"...HEAD -- 'tests/**')
+          if [ -n "$changed" ]; then
+            echo "::warning::Test files changed in this PR:"
+            printf '%s\n' "$changed"
+          fi
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings

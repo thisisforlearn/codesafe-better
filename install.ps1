@@ -2,19 +2,18 @@
 #
 # Usage (PowerShell):
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
-#   irm https://raw.githubusercontent.com/sudo-linux-neko/codesafe/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/thisisforlearn/codesafe-better/main/install.ps1 | iex
 #
 # Installs to: ~/bin/codeguard.exe and ~/bin/codesafe.exe (alias)
 #
 $ErrorActionPreference = "Stop"
 
-$REPO = "sudo-linux-neko/codesafe"
+$REPO = "thisisforlearn/codesafe-better"
 $BIN_NAME = "codeguard.exe"
 $ALIAS_NAME = "codesafe.exe"
 
-# Detect architecture
-$ARCH = [Environment]::Is64BitProcess ? "x86_64" : "i686"
-$PLATFORM = "pc-windows-gnu"  # MSYS2/MinGW build target
+# Detect architecture (Windows PowerShell 5 compatible)
+$ARCH = if ([Environment]::Is64BitProcess) { "x86_64" } else { "i686" }
 
 # Choose install directory
 $INSTALL_DIR = Join-Path $env:USERPROFILE "bin"
@@ -26,7 +25,7 @@ Write-Host "==> Installing codeguard to $INSTALL_DIR" -ForegroundColor Cyan
 
 # Try downloading a prebuilt release from GitHub
 $RELEASES_API = "https://api.github.com/repos/$REPO/releases/latest"
-$ASSET_NAME = "codeguard-${ARCH}-${PLATFORM}.exe"
+$ASSET_NAME = "codeguard-windows-${ARCH}.exe"
 $DOWNLOAD_URL = $null
 
 try {
@@ -61,7 +60,11 @@ if ($DOWNLOAD_URL) {
 # Create alias codesafe.exe -> codeguard.exe
 $aliasPath = Join-Path $INSTALL_DIR $ALIAS_NAME
 if (-not (Test-Path $aliasPath)) {
-  New-Item -ItemType SymbolicLink -Path $aliasPath -Target (Join-Path $INSTALL_DIR $BIN_NAME) -Force
+  try {
+    New-Item -ItemType SymbolicLink -Path $aliasPath -Target (Join-Path $INSTALL_DIR $BIN_NAME) -Force | Out-Null
+  } catch {
+    Copy-Item -Path (Join-Path $INSTALL_DIR $BIN_NAME) -Destination $aliasPath -Force
+  }
 }
 
 # Ensure INSTALL_DIR is on PATH

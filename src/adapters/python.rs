@@ -15,7 +15,7 @@ impl LanguageAdapter for Python {
     }
 
     fn detect(&self, path: &Path) -> Result<bool> {
-        Ok(has_python_files(path) || has_python_config(path))
+        Ok(has_python_config(path) || has_python_files(path))
     }
 
     fn build(&self, ctx: Context<'_>) -> Result<ToolResult> {
@@ -123,7 +123,7 @@ fn python_executable() -> Option<&'static str> {
 }
 
 fn has_python_files(path: &Path) -> bool {
-    !find_files_by_ext(path, &["py"]).is_empty()
+    crate::scan::has_files_with_ext(path, &["py"])
 }
 
 fn has_python_config(path: &Path) -> bool {
@@ -139,20 +139,7 @@ fn has_python_config(path: &Path) -> bool {
 }
 
 fn find_files_by_ext(path: &Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| !crate::scan::is_ignored_dir(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            let ext = e.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-            if exts.contains(&ext) {
-                Some(e.path().to_path_buf())
-            } else {
-                None
-            }
-        })
-        .collect()
+    crate::scan::files_with_ext(path, exts)
 }
 
 /// Benchmarks via pytest-benchmark JSON output.
@@ -211,11 +198,37 @@ fn bench_python(ctx: Context<'_>) -> Result<Vec<BenchmarkResult>> {
     Ok(out)
 }
 
-/// Profile via pstats cumulative output.
-fn profile_python(_ctx: Context<'_>) -> Result<Vec<Hotspot>> {
-    // cProfile needs a concrete entry point; without one we report no hotspots
-    // rather than guessing a command.
-    Ok(vec![])
+/// Profile the test suite with py-spy when available.
+///
+/// py-spy does not require modifying the program and works for normal Python
+/// processes. Raw collapsed stacks are aggregated by leaf frame.
+fn profile_python(ctx: Context<'_>) -> Result<Vec<Hotspot>> {
+    if require_tool("py-spy")?.skipped {
+        return Ok(vec![]);
+    }
+    let Some(python) = python_executable() else {
+        return Ok(vec![]);
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "codesafe-profile-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let tmp_str = tmp.to_string_lossy().to_string();
+    let _ = run_command(
+        ctx.path,
+        "py-spy",
+        &[
+            "record", "-f", "raw", "-o", &tmp_str, "--", python, "-m", "pytest", "-q",
+        ],
+        ctx.timeout_s,
+    )?;
+    let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    Ok(crate::adapters::parse_raw_profile(&text))
 }
 
 /// Safe fixes: apply each safe Python rule's action (e.g. ruff format / ruff check --fix).

@@ -1,0 +1,9 @@
+# Test changes require owner review. This is the same guard codesafe enforces:
+# agents may propose test changes, but they cannot silently approve them.
+/tests/            @thisisforlearn
+**/tests/          @thisisforlearn
+**/test_*.py       @thisisforlearn
+**/*_test.rs       @thisisforlearn
+**/*test*.cpp      @thisisforlearn
+/src/verification.rs @thisisforlearn
+/src/rule_engine.rs  @thisisforlearn

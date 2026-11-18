@@ -4,13 +4,13 @@
 
 ### Linux / macOS / Termux (bash)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sudo-linux-neko/codesafe/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thisisforlearn/codesafe-better/main/install.sh | bash
 ```
 
 ### Windows (PowerShell)
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-irm https://raw.githubusercontent.com/sudo-linux-neko/codesafe/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/thisisforlearn/codesafe-better/main/install.ps1 | iex
 ```
 
 ## What gets installed
@@ -46,7 +46,17 @@ codeguard report .
 | `fix` | Apply safe rule-based fixes with verification |
 | `report` | Write `report.md` (human) + `report.json` (AI) |
 | `all` | Scan → test → bench → fix → report |
-| `init` | Initialize `codesafe.toml` config & `rules/` directory |
+| `init` | Initialize `codesafe.toml` config & a comprehensive `rules/` pack |
+| `brief` | Build an LLM-ready task packet (`AGENT_TASK.md` + JSON) |
+| `optimize` | Ranked optimization suggestions with gain/risk/verification |
+| `mutate` | Diff-scoped mutation testing (cargo-mutants / mutmut) |
+| `cover` | Static coverage estimate and complexity hotspots |
+| `gen-test` | Generate tests for hotspots (`--write` to create files) |
+| `heal` | Bounded test → safe-fix → retest loop |
+| `verify` | Anti-gaming verification of the working tree |
+| `replay` | Replay the durable event log |
+| `schema` | JSON schema of every command |
+| `generate-skill` | Agent tool-definition document |
 | `spec` | Write acceptance criteria spec (test-writing agent only) |
 | `red` | Write a RED test from a spec |
 | `verify` | Run RED-first verification with anti-gaming checks |
@@ -91,7 +101,7 @@ codeguard --dry_run fix .
 ## Build from source
 
 ```bash
-git clone https://github.com/sudo-linux-neko/codesafe.git
+git clone https://github.com/thisisforlearn/codesafe-better.git
 cd codesafe
 cargo build --release
 cp target/release/codeguard ~/bin/
@@ -99,4 +109,4 @@ cp target/release/codeguard ~/bin/
 
 ## Repository
 
-https://github.com/sudo-linux-neko/codesafe
+https://github.com/thisisforlearn/codesafe-better

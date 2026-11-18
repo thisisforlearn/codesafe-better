@@ -7,7 +7,6 @@
 use clap::Parser;
 use serde::Serialize;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use crate::aci::OutputMode;
 use crate::types::{Config, Severity};
@@ -23,9 +22,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 
-    /// Path to codesafe.toml config file.
-    #[arg(long, global = true, default_value = "codesafe.toml")]
-    pub config: PathBuf,
+    /// Path to a codesafe.toml (or codeguard.toml) config file.
+    /// When omitted, the repository's config is auto-discovered.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
 
     /// Number of parallel jobs.
     #[arg(long, global = true, short = 'j')]
@@ -123,7 +123,7 @@ pub enum Command {
     Cover {
         #[arg(value_name = "PATH", default_value = ".")]
         path: PathBuf,
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "3")]
         min_complexity: u32,
         #[arg(long, default_value = "50.0")]
         max_coverage_pct: f64,
@@ -134,6 +134,9 @@ pub enum Command {
         path: PathBuf,
         #[arg(long, default_value = "10")]
         max_tests: u32,
+        /// Write generated test skeletons into the repository (default: report only).
+        #[arg(long)]
+        write: bool,
     },
     /// Run self-healing loop: generate → review → verify → fix.
     Heal {
@@ -153,16 +156,42 @@ pub enum Command {
     Schema,
     /// Replay the event-sourced orchestration log.
     Replay {
-        #[arg(value_name = "PATH", default_value = ".codeguard/events.jsonl")]
+        #[arg(value_name = "PATH", default_value = ".codesafe/events.jsonl")]
         path: PathBuf,
+    },
+    /// Run mutation testing scoped to the current git diff (Rust/Python).
+    Mutate {
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// Soft cap used when reporting; full tool behavior is unchanged.
+        #[arg(long, default_value = "200")]
+        max_mutants: u32,
+    },
+    /// Analyze code and emit concrete optimization suggestions.
+    Optimize {
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// Maximum number of suggestions to emit.
+        #[arg(long, default_value = "60")]
+        max: usize,
+    },
+    /// Build a complete, LLM-ready task packet (agent brief) for this repo.
+    Brief {
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// Write `.codesafe/agent-brief.json` and `AGENT_TASK.md`.
+        #[arg(long, default_value_t = true)]
+        write: bool,
     },
     /// Run a command in hermetic (isolated) execution context.
     Hermetic {
         #[arg(value_name = "COMMAND")]
         command: String,
-        #[arg(value_name = "ARGS", value_delimiter = ' ')]
+        /// Arguments passed to the command. Use `--` before them.
+        #[arg(value_name = "ARGS", num_args = 0.., trailing_var_arg = true)]
         args: Vec<String>,
-        #[arg(value_name = "PATH", default_value = ".")]
+        /// Working directory for the command.
+        #[arg(long, value_name = "PATH", default_value = ".")]
         path: PathBuf,
     },
 }
@@ -183,23 +212,39 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub fn from_cli(cli: &Cli, config: Config) -> crate::Result<Self> {
+    pub fn from_cli(
+        cli: &Cli,
+        config: Config,
+        config_path: PathBuf,
+        output_mode: OutputMode,
+    ) -> crate::Result<Self> {
         config.validate()?;
-        let output_mode = OutputMode::from_str(&cli.output).map_err(crate::Error::Config)?;
+        let fail_on = match &cli.fail_on {
+            Some(raw) => Some(raw.parse::<Severity>().map_err(crate::Error::Config)?),
+            None => config.fail_on(),
+        };
+        if let Some(jobs) = cli.jobs
+            && jobs == 0
+        {
+            return Err(crate::Error::Config("jobs must be at least 1".into()));
+        }
+        if let Some(timeout) = cli.timeout
+            && timeout == 0
+        {
+            return Err(crate::Error::Config(
+                "timeout must be at least 1 second".into(),
+            ));
+        }
         Ok(Self {
             jobs: cli.jobs.unwrap_or(config.jobs()),
             timeout_s: cli.timeout.or(config.timeout_s()),
-            fail_on: cli
-                .fail_on
-                .as_ref()
-                .and_then(|s| s.parse::<Severity>().ok())
-                .or(config.fail_on()),
+            fail_on,
             dry_run: cli.dry_run || config.dry_run.unwrap_or(false),
             force: cli.force || config.force.unwrap_or(false),
             bench_runs: config.bench_runs(),
             regression_threshold_pct: config.regression_threshold_pct(),
             rules_dir: config.rules_dir.clone(),
-            config_path: cli.config.clone(),
+            config_path,
             output_mode,
         })
     }
@@ -238,7 +283,10 @@ pub fn schema_json() -> serde_json::Value {
             "cover": { "description": "Analyze coverage and identify hotspots needing tests", "args": { "path": { "type": "string", "default": "." }, "min_complexity": { "type": "integer", "default": 5 }, "max_coverage_pct": { "type": "number", "default": 50.0 } } },
             "gen-test": { "description": "Generate tests targeting coverage hotspots", "args": { "path": { "type": "string", "default": "." }, "max_tests": { "type": "integer", "default": 10 } } },
             "heal": { "description": "Run self-healing loop: generate → review → verify → fix", "args": { "path": { "type": "string", "default": "." }, "max_retries": { "type": "integer", "default": 5 } } },
-            "replay": { "description": "Replay the event-sourced orchestration log", "args": { "path": { "type": "string", "default": ".codeguard/events.jsonl" } } },
+            "replay": { "description": "Replay the event-sourced orchestration log", "args": { "path": { "type": "string", "default": ".codesafe/events.jsonl" } } },
+            "mutate": { "description": "Run mutation testing scoped to the current git diff (cargo-mutants / mutmut)", "args": { "path": { "type": "string", "default": "." }, "max_mutants": { "type": "integer", "default": 200 } } },
+            "optimize": { "description": "Emit concrete optimization suggestions with gain, risk and verification", "args": { "path": { "type": "string", "default": "." }, "max": { "type": "integer", "default": 60 } } },
+            "brief": { "description": "Build an LLM-ready task packet (folder/file/line/symbol/snippet/fix plan/definition of done)", "args": { "path": { "type": "string", "default": "." }, "write": { "type": "boolean", "default": true } } },
             "hermetic": { "description": "Run a command in hermetic (isolated) execution context", "args": { "command": { "type": "string" }, "args": { "type": "array", "items": { "type": "string" } }, "path": { "type": "string", "default": "." } } },
         },
         "output_envelope": {
@@ -279,7 +327,7 @@ pub fn skill_document(path: &str) -> String {
         r#"{{
   "name": "codesafe",
   "description": "Test, benchmark, profile and safely auto-fix Python/Rust/C++ repositories. Epistemic infrastructure for agentic coding.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "commands": [
     {{
       "name": "codesafe scan",
@@ -481,7 +529,7 @@ pub fn skill_document(path: &str) -> String {
       "parameters": {{
         "type": "object",
         "properties": {{
-          "path": {{ "type": "string", "description": "Path to the event log (default: .codeguard/events.jsonl)" }},
+          "path": {{ "type": "string", "description": "Path to the event log (default: .codesafe/events.jsonl)" }},
           "output": {{ "type": "string", "enum": ["human", "json", "jsonl"], "description": "Output mode (default: human)" }}
         }},
         "required": [],
@@ -500,6 +548,47 @@ pub fn skill_document(path: &str) -> String {
           "output": {{ "type": "string", "enum": ["human", "json", "jsonl"], "description": "Output mode (default: human)" }}
         }},
         "required": ["command"],
+        "additionalProperties": false
+      }}
+    }},
+    {{
+      "name": "codesafe mutate",
+      "description": "Run mutation testing scoped to the current git diff and report surviving mutants as follow-up tasks.",
+      "parameters": {{
+        "type": "object",
+        "properties": {{
+          "path": {{ "type": "string", "description": "Repository path (default: .)" }},
+          "output": {{ "type": "string", "enum": ["human", "json", "jsonl"], "description": "Output mode (default: human)" }}
+        }},
+        "required": [],
+        "additionalProperties": false
+      }}
+    }},
+    {{
+      "name": "codesafe optimize",
+      "description": "Emit concrete optimization suggestions with location, explanation, expected gain, risk and verification command.",
+      "parameters": {{
+        "type": "object",
+        "properties": {{
+          "path": {{ "type": "string", "description": "Repository path (default: .)" }},
+          "max": {{ "type": "integer", "description": "Maximum suggestions (default: 60)" }},
+          "output": {{ "type": "string", "enum": ["human", "json", "jsonl"], "description": "Output mode (default: human)" }}
+        }},
+        "required": [],
+        "additionalProperties": false
+      }}
+    }},
+    {{
+      "name": "codesafe brief",
+      "description": "Build a complete LLM-ready task packet: folder, file, line, symbol, snippet, evidence, root-cause hypothesis, fix plan, risks and definition of done.",
+      "parameters": {{
+        "type": "object",
+        "properties": {{
+          "path": {{ "type": "string", "description": "Repository path (default: .)" }},
+          "write": {{ "type": "boolean", "description": "Write .codesafe/agent-brief.json and AGENT_TASK.md (default: true)" }},
+          "output": {{ "type": "string", "enum": ["human", "json", "jsonl"], "description": "Output mode (default: human)" }}
+        }},
+        "required": [],
         "additionalProperties": false
       }}
     }}

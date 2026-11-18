@@ -2,7 +2,7 @@
 # install.sh — Install codeguard/codesafe on Linux, macOS, and Termux
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/sudo-linux-neko/codesafe/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/thisisforlearn/codesafe-better/main/install.sh | bash
 #
 # Installs to:
 #   - ~/bin/ on Termux / Linux
@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-REPO="sudo-linux-neko/codesafe"
+REPO="thisisforlearn/codesafe-better"
 BIN_NAME="codeguard"
 ALIAS_NAME="codesafe"
 
@@ -26,8 +26,8 @@ case "$ARCH" in
 esac
 
 case "$OS" in
-  linux)   PLATFORM="unknown-linux-gnu" ;;
-  darwin)  PLATFORM="apple-darwin" ;;
+  linux)   PLATFORM="linux" ;;
+  darwin)  PLATFORM="macos" ;;
   *) echo "Unsupported OS: $OS" ; exit 1 ;;
 esac
 
@@ -43,7 +43,7 @@ echo "==> Installing codeguard to $INSTALL_DIR"
 
 # Try downloading a prebuilt release from GitHub
 RELEASES_API="https://api.github.com/repos/${REPO}/releases/latest"
-ASSET_NAME="codeguard-${ARCH}-${PLATFORM}"
+ASSET_NAME="codeguard-${PLATFORM}-${ARCH}"
 
 DOWNLOAD_URL=""
 if command -v curl >/dev/null 2>&1; then

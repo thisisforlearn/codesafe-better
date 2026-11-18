@@ -231,50 +231,297 @@ pub fn parse_generic_compiler(output: &str, tool: &str, trace_id: &str) -> Vec<P
     let mut diagnostics = Vec::new();
 
     // Generic format: file:line:col: error: message
-    // or: file:line: warning: message
+    //                file:line: warning: message
+    //                C:\path\file.cpp:12: error: message
     for line in output.lines() {
-        if line.contains("error:") || line.contains("warning:") || line.contains("Error:") {
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let file = parts[0].trim().to_string();
-                let line_num: Option<u32> = parts[1].trim().parse().ok();
-                let col: Option<u32> = parts[2].trim().parse().ok();
-                let rest = parts[3].trim();
-
-                let severity = if rest.to_lowercase().contains("error") {
-                    Severity::Error
-                } else {
-                    Severity::Warning
-                };
-
-                let error_type = rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("error")
-                    .to_string();
-                let message = rest[rest.find(' ').map(|p| p + 1).unwrap_or(0)..]
-                    .trim()
-                    .to_string();
-
-                diagnostics.push(ParsedDiagnostic {
-                    trace_id: trace_id.to_string(),
-                    tool: tool.to_string(),
-                    severity,
-                    file: Some(file),
-                    line: line_num,
-                    column: col,
-                    error_type,
-                    message,
-                    context_lines: vec![line.to_string()],
-                    suggestion: None,
-                    confidence: 0.8,
-                    is_retryable: false,
-                });
-            }
+        let trimmed_line = line.trim_start();
+        if trimmed_line.starts_with('{') || trimmed_line.contains("\"reason\":\"compiler-message\"")
+        {
+            // Structured cargo JSON has its own parser; its escaped text must
+            // not be mistaken for a plain compiler line.
+            continue;
         }
+        let lower = line.to_lowercase();
+        if !(lower.contains("error:")
+            || lower.contains("warning:")
+            || lower.contains("fatal error:"))
+        {
+            continue;
+        }
+        let Some((file, line_num, col, rest)) = split_location(line) else {
+            continue;
+        };
+        if !looks_like_source(&file) {
+            continue;
+        }
+        let severity = if lower.contains("error") {
+            Severity::Error
+        } else {
+            Severity::Warning
+        };
+        let error_type = rest
+            .split_once(':')
+            .map(|(kind, _)| kind.trim())
+            .unwrap_or("diagnostic")
+            .to_string();
+        let message = rest
+            .split_once(':')
+            .map(|(_, msg)| msg.trim())
+            .unwrap_or(rest)
+            .to_string();
+        diagnostics.push(ParsedDiagnostic {
+            trace_id: trace_id.to_string(),
+            tool: tool.to_string(),
+            severity,
+            file: Some(file),
+            line: line_num,
+            column: col,
+            error_type,
+            message,
+            context_lines: vec![line.to_string()],
+            suggestion: None,
+            confidence: 0.8,
+            is_retryable: false,
+        });
     }
 
     diagnostics
+}
+
+/// Parse mypy output (`file.py:10: error: message [code]`).
+pub fn parse_mypy(stdout: &str, stderr: &str, trace_id: &str) -> Vec<ParsedDiagnostic> {
+    let mut out = Vec::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        if !line.contains(": error:") && !line.contains(": warning:") && !line.contains(": note:") {
+            continue;
+        }
+        let Some((file, line_num, col, rest)) = split_location(line) else {
+            continue;
+        };
+        if !file.ends_with(".py") {
+            continue;
+        }
+        let (severity, rest) = if let Some(r) = rest.strip_prefix("error:") {
+            (Severity::Error, r.trim())
+        } else if let Some(r) = rest.strip_prefix("warning:") {
+            (Severity::Warning, r.trim())
+        } else if let Some(r) = rest.strip_prefix("note:") {
+            (Severity::Info, r.trim())
+        } else {
+            (Severity::Warning, rest.trim())
+        };
+        let code = rest
+            .rsplit_once('[')
+            .and_then(|(_, tail)| tail.strip_suffix(']'))
+            .unwrap_or("mypy");
+        out.push(ParsedDiagnostic {
+            trace_id: trace_id.to_string(),
+            tool: "mypy".to_string(),
+            severity,
+            file: Some(file.clone()),
+            line: line_num,
+            column: col,
+            error_type: code.to_string(),
+            message: rest
+                .rsplit_once(" [")
+                .map(|(m, _)| m)
+                .unwrap_or(rest)
+                .trim()
+                .to_string(),
+            context_lines: vec![line.to_string()],
+            suggestion: Some(format!("fix the type error in {file} and re-run mypy")),
+            confidence: 0.92,
+            is_retryable: true,
+        });
+    }
+    out
+}
+
+/// Parse bandit output (`>> Issue: [B602:subprocess_popen_with_shell_equals_true] ...`).
+pub fn parse_bandit(stdout: &str, stderr: &str, trace_id: &str) -> Vec<ParsedDiagnostic> {
+    let mut out = Vec::new();
+    let text = format!("{stdout}\n{stderr}");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.trim().strip_prefix(">> Issue:") {
+            let (message, code) = parse_bandit_issue(rest);
+            let mut file = None;
+            let mut line_num = None;
+            for follow in lines.iter().skip(i + 1).take(8) {
+                let f = follow.trim();
+                if let Some(v) = f.strip_prefix("Location:") {
+                    if let Some((fpath, lnum, _, _)) = split_location(v.trim()) {
+                        file = Some(fpath);
+                        line_num = lnum;
+                    }
+                }
+            }
+            out.push(ParsedDiagnostic {
+                trace_id: trace_id.to_string(),
+                tool: "bandit".to_string(),
+                severity: Severity::Error,
+                file,
+                line: line_num,
+                column: None,
+                error_type: code,
+                message,
+                context_lines: vec![line.to_string()],
+                suggestion: Some(
+                    "review the security finding and fix the unsafe call, not the test".to_string(),
+                ),
+                confidence: 0.85,
+                is_retryable: false,
+            });
+        }
+        i += 1;
+    }
+    out
+}
+
+fn parse_bandit_issue(rest: &str) -> (String, String) {
+    // [B602:subprocess_popen_with_shell_equals_true] subprocess call with shell=True
+    if let Some(start) = rest.find('[') {
+        if let Some(end_rel) = rest[start..].find(']') {
+            let code = &rest[start + 1..start + end_rel];
+            let code = code
+                .split(':')
+                .next()
+                .unwrap_or("bandit")
+                .trim()
+                .to_string();
+            let message = rest[start + end_rel + 1..].trim().to_string();
+            return (message, code);
+        }
+    }
+    (rest.trim().to_string(), "bandit".to_string())
+}
+
+/// Parse cargo/rustc JSON diagnostics emitted with `--message-format=json`.
+pub fn parse_cargo_json(output: &str, trace_id: &str) -> Vec<ParsedDiagnostic> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(diag) = value.get("diagnostic").or_else(|| value.get("message")) else {
+            continue;
+        };
+        if diag.get("spans").is_none() && diag.get("level").is_none() {
+            continue;
+        }
+        let severity = match diag
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+        {
+            "error" | "error: internal compiler error" => Severity::Error,
+            "warning" => Severity::Warning,
+            _ => Severity::Info,
+        };
+        let message = diag
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cargo diagnostic")
+            .to_string();
+        let code = diag
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("rustc")
+            .to_string();
+        let mut file = None;
+        let mut line_num = None;
+        let mut column = None;
+        if let Some(spans) = diag.get("spans").and_then(|v| v.as_array()) {
+            if let Some(span) = spans
+                .iter()
+                .find(|s| {
+                    s.get("is_primary")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+                .or_else(|| spans.first())
+            {
+                file = span
+                    .get("file_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                line_num = span
+                    .get("line_start")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                column = span
+                    .get("column_start")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+            }
+        }
+        out.push(ParsedDiagnostic {
+            trace_id: trace_id.to_string(),
+            tool: "cargo".to_string(),
+            severity,
+            file,
+            line: line_num,
+            column,
+            error_type: code,
+            message,
+            context_lines: vec![line.to_string()],
+            suggestion: Some("apply the compiler suggestion, then rerun cargo test".to_string()),
+            confidence: 0.95,
+            is_retryable: true,
+        });
+    }
+    out
+}
+
+/// Split `file:line[:col]: rest` while tolerating Windows drive letters.
+fn split_location(line: &str) -> Option<(String, Option<u32>, Option<u32>, &str)> {
+    let mut positions = Vec::new();
+    for (idx, _) in line.match_indices(':') {
+        positions.push(idx);
+    }
+    for (n, &pos) in positions.iter().enumerate() {
+        let after = &line[pos + 1..];
+        let token: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if token.is_empty() {
+            continue;
+        }
+        let line_num: u32 = token.parse().ok()?;
+        let mut consumed = token.len();
+        let mut col = None;
+        let remainder = &after[consumed..];
+        if let Some(rest) = remainder.strip_prefix(':') {
+            let col_token: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !col_token.is_empty() {
+                col = col_token.parse().ok();
+                consumed += 1 + col_token.len();
+            }
+        }
+        let file = line[..pos].trim().to_string();
+        let rest = after[consumed..].trim_start_matches(':').trim();
+        if !file.is_empty() {
+            let _ = n;
+            return Some((file, Some(line_num), col, rest));
+        }
+    }
+    None
+}
+
+fn looks_like_source(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(
+        ext,
+        "py" | "rs" | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hxx"
+    )
 }
 
 /// Attach recovery hints to parsed diagnostics using heuristics.
@@ -404,5 +651,51 @@ SyntaxError: unterminated string literal (detected at line 6)
                 .unwrap()
                 .contains("ruff check --fix")
         );
+    }
+
+    #[test]
+    fn parse_generic_handles_windows_paths() {
+        let diags = parse_generic_compiler(
+            r"C:\repo\src\main.cpp:12:3: error: expected ';'",
+            "clang++",
+            "cs-win",
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file.as_deref(), Some(r"C:\repo\src\main.cpp"));
+        assert_eq!(diags[0].line, Some(12));
+        assert_eq!(diags[0].column, Some(3));
+        assert_eq!(diags[0].error_type, "error");
+        assert!(diags[0].message.contains("expected"));
+    }
+
+    #[test]
+    fn parse_mypy_extracts_code() {
+        let out = "src/app.py:7: error: Incompatible types in assignment [assignment]\n";
+        let diags = parse_mypy(out, "", "cs-mypy");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].error_type, "assignment");
+        assert_eq!(diags[0].line, Some(7));
+        assert!(diags[0].message.contains("Incompatible types"));
+    }
+
+    #[test]
+    fn parse_bandit_extracts_location() {
+        let out = ">> Issue: [B602:subprocess_popen_with_shell_equals_true] shell=True\n   Location: src/run.py:9:4\n";
+        let diags = parse_bandit(out, "", "cs-bandit");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].error_type, "B602");
+        assert_eq!(diags[0].file.as_deref(), Some("src/run.py"));
+        assert_eq!(diags[0].line, Some(9));
+    }
+
+    #[test]
+    fn parse_cargo_json_extracts_span() {
+        let line = r#"{"reason":"compiler-message","message":{"rendered":"...","message":"unused variable: `x`","code":{"code":"unused_variables"},"level":"warning","spans":[{"file_name":"src/main.rs","line_start":4,"column_start":9,"is_primary":true}]}}"#;
+        let diags = parse_cargo_json(line, "cs-cargo");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].error_type, "unused_variables");
+        assert_eq!(diags[0].file.as_deref(), Some("src/main.rs"));
+        assert_eq!(diags[0].line, Some(4));
+        assert_eq!(diags[0].column, Some(9));
     }
 }

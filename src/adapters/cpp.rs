@@ -7,7 +7,6 @@ use crate::adapters::{
 };
 use crate::types::{BenchmarkResult, Language, Rule, RuleSafety, ToolResult};
 use std::path::Path;
-use walkdir::WalkDir;
 
 pub struct Cpp;
 
@@ -17,10 +16,10 @@ impl LanguageAdapter for Cpp {
     }
 
     fn detect(&self, path: &Path) -> Result<bool> {
-        Ok(has_cpp_files(path)
-            || path.join("CMakeLists.txt").is_file()
+        Ok(path.join("CMakeLists.txt").is_file()
             || path.join("Makefile").is_file()
-            || path.join("makefile").is_file())
+            || path.join("makefile").is_file()
+            || has_cpp_files(path))
     }
 
     fn build(&self, ctx: Context<'_>) -> Result<ToolResult> {
@@ -137,11 +136,14 @@ impl LanguageAdapter for Cpp {
         bench_cpp(ctx)
     }
 
-    fn profile(&self, _ctx: Context<'_>) -> Result<Vec<Hotspot>> {
-        if require_tool("perf")?.skipped {
-            return Ok(vec![]);
-        }
-        Ok(vec![])
+    fn profile(&self, ctx: Context<'_>) -> Result<Vec<Hotspot>> {
+        let build = ctx.path.join("build");
+        let args: &[&str] = if build.is_dir() {
+            &["ctest", "--test-dir", "build", "--output-on-failure"]
+        } else {
+            &["make", "test"]
+        };
+        crate::adapters::perf_hotspots(ctx.path, args, ctx.timeout_s)
     }
 
     fn fix(&self, ctx: Context<'_>, rules: &[Rule]) -> Result<Vec<FixResult>> {
@@ -153,26 +155,33 @@ impl LanguageAdapter for Cpp {
 /// do not support it). Formats each source file to stdout and reports any file
 /// whose formatted output differs from the on-disk content.
 fn lint_clang_format(ctx: Context<'_>) -> Result<ToolResult> {
+    use rayon::prelude::*;
     let files = cpp_source_files(ctx.path);
     if files.is_empty() {
         return Ok(skipped("clang-format"));
     }
-    let mut unformatted = Vec::new();
-    for f in &files {
-        let res = run_command(
-            ctx.path,
-            "clang-format",
-            &[f.to_str().unwrap_or("")],
-            ctx.timeout_s,
-        )?;
-        let original = match std::fs::read(f) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        if res.stdout.as_bytes() != original.as_slice() {
-            unformatted.push(f.to_string_lossy().to_string());
-        }
-    }
+    // Formatting checks are independent per file; run them in parallel to keep
+    // large C++ trees fast on multi-core machines.
+    let checks: Result<Vec<bool>> = files
+        .par_iter()
+        .map(|f| {
+            let res = run_command(
+                ctx.path,
+                "clang-format",
+                &[f.to_str().unwrap_or("")],
+                ctx.timeout_s,
+            )?;
+            let original = std::fs::read(f).unwrap_or_default();
+            Ok(!res.success() || res.stdout.as_bytes() != original.as_slice())
+        })
+        .collect();
+    let checks = checks?;
+    let unformatted: Vec<String> = files
+        .iter()
+        .zip(checks)
+        .filter(|(_, needs_format)| *needs_format)
+        .map(|(f, _)| f.to_string_lossy().to_string())
+        .collect();
     if unformatted.is_empty() {
         Ok(ToolResult {
             tool: "clang-format".into(),
@@ -200,20 +209,7 @@ fn lint_clang_format(ctx: Context<'_>) -> Result<ToolResult> {
 
 /// Collect C/C++ source files under `path`, ignoring common build/cache dirs.
 fn cpp_source_files(path: &Path) -> Vec<std::path::PathBuf> {
-    let exts = ["cpp", "cc", "cxx", "h", "hpp", "hxx"];
-    WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| !crate::scan::is_ignored_dir(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| exts.contains(&ext))
-        })
-        .map(|e| e.into_path())
-        .collect()
+    crate::scan::files_with_ext(path, &["cpp", "cc", "cxx", "h", "hpp", "hxx"])
 }
 
 fn skipped(tool: &str) -> ToolResult {
@@ -234,24 +230,11 @@ fn path_join_exists(path: &Path, name: &str) -> bool {
 }
 
 fn has_cpp_files(path: &Path) -> bool {
-    !find_files_by_ext(path, &["cpp", "cc", "cxx", "c", "h", "hpp", "hxx"]).is_empty()
+    crate::scan::has_files_with_ext(path, &["cpp", "cc", "cxx", "c", "h", "hpp", "hxx"])
 }
 
 fn find_files_by_ext(path: &Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| !crate::scan::is_ignored_dir(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            let ext = e.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-            if exts.contains(&ext) {
-                Some(e.path().to_path_buf())
-            } else {
-                None
-            }
-        })
-        .collect()
+    crate::scan::files_with_ext(path, exts)
 }
 
 /// Find a libFuzzer-style fuzz binary under build/.

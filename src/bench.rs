@@ -39,31 +39,34 @@ pub struct BenchmarkCache {
 
 impl BenchmarkCache {
     pub fn new(path: &Path) -> Result<Self> {
-        let dir = path.join(".codeguard").join("cache");
+        let dir = path.join(".codesafe").join("cache");
         Ok(Self {
             cache: Cache::new(&dir)?,
         })
     }
 
-    fn key(language: Language, source_hash: &str, name: &str) -> String {
-        format!("bench:{language}:{source_hash}:{name}")
+    fn key(language: Language, name: &str) -> String {
+        // Deliberately not keyed by source hash: the point of regression
+        // detection is to compare the current code with the previous run of the
+        // same benchmark, even (especially) after the source changed.
+        format!("bench:{language}:{name}")
     }
 
-    pub fn previous(&self, language: Language, source_hash: &str, name: &str) -> Option<f64> {
+    pub fn previous(&self, language: Language, _source_hash: &str, name: &str) -> Option<f64> {
         self.cache
-            .get(&Self::key(language, source_hash, name))
+            .get(&Self::key(language, name))
             .and_then(|v| v.parse::<f64>().ok())
     }
 
     pub fn store(
         &mut self,
         language: Language,
-        source_hash: &str,
+        _source_hash: &str,
         name: &str,
         value: f64,
     ) -> Result<()> {
         self.cache
-            .put(&Self::key(language, source_hash, name), &value.to_string())
+            .put(&Self::key(language, name), &value.to_string())
     }
 }
 
@@ -86,6 +89,23 @@ mod tests {
     fn measure_empty_is_none() {
         let result = measure(3, || Ok(None)).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn benchmark_cache_detects_change_across_source_versions() {
+        let dir = std::env::temp_dir().join(format!("codesafe-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = BenchmarkCache::new(&dir).unwrap();
+        assert_eq!(cache.previous(Language::Rust, "hash-a", "parse"), None);
+        cache
+            .store(Language::Rust, "hash-a", "parse", 100.0)
+            .unwrap();
+        // A different source hash must still find the previous run.
+        assert_eq!(
+            cache.previous(Language::Rust, "hash-b", "parse"),
+            Some(100.0)
+        );
     }
 
     #[test]

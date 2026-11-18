@@ -165,6 +165,11 @@ pub fn scan(path: &Path) -> Result<ScanResult> {
         });
     }
 
+    source_files.sort();
+    config_files.sort();
+    languages.sort_by_key(|l| l.to_string());
+    build_systems.sort_by_key(|b| b.to_string());
+
     let tools = detect_tools(&languages);
     let tool_results = flatten_tools(&tools);
 
@@ -189,15 +194,161 @@ pub(crate) fn is_ignored_dir(entry: &walkdir::DirEntry) -> bool {
         && matches!(
             entry.file_name().to_str(),
             Some(".git")
+                | Some(".codeguard")
+                | Some(".codesafe")
                 | Some("target")
                 | Some("node_modules")
                 | Some(".venv")
                 | Some("venv")
+                | Some(".tox")
                 | Some("__pycache__")
+                | Some(".mypy_cache")
+                | Some(".pytest_cache")
+                | Some(".ruff_cache")
                 | Some("build")
                 | Some("dist")
-                | Some("fixtures")
+                | Some("coverage")
+                | Some("vendor")
+                | Some("third_party")
         )
+}
+
+/// All files under `root` with one of the given extensions (without the dot).
+/// Results are sorted so callers get deterministic behaviour and stable hashes.
+pub fn files_with_ext(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_dir(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| exts.contains(&ext))
+        })
+        .map(|e| e.into_path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// True if at least one file with one of the extensions exists. Short-circuits
+/// the directory walk as soon as a match is found (cheaper than `files_with_ext`
+/// when only presence matters, e.g. language detection).
+pub fn has_files_with_ext(root: &Path, exts: &[&str]) -> bool {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_dir(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .any(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| exts.contains(&ext))
+        })
+}
+
+/// Extensions considered source code for a language.
+pub fn source_extensions(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python => &["py"],
+        Language::Rust => &["rs"],
+        Language::Cpp => &["cpp", "cc", "cxx", "c", "h", "hpp", "hxx"],
+    }
+}
+
+/// All regular files under `root` (sorted), ignoring common build/cache dirs.
+pub fn all_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_dir(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Match a repository-relative path against a simple glob.
+///
+/// Supports `*` (within one path segment), `**` (any number of segments), and
+/// `?` (one character). This is intentionally small and dependency-free.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    fn matches(pat: &[u8], name: &[u8]) -> bool {
+        if pat.is_empty() {
+            return name.is_empty();
+        }
+        match pat[0] {
+            b'*' => {
+                if pat.len() > 1 && pat[1] == b'*' {
+                    // `**` matches across separators.
+                    let rest = &pat[2..];
+                    let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                    if rest.is_empty() {
+                        return true;
+                    }
+                    for i in 0..=name.len() {
+                        if matches(rest, &name[i..]) {
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    let rest = &pat[1..];
+                    for i in 0..=name.len() {
+                        if i > 0 && name[i - 1] == b'/' {
+                            break;
+                        }
+                        if matches(rest, &name[i..]) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+            b'?' => !name.is_empty() && name[0] != b'/' && matches(&pat[1..], &name[1..]),
+            c => !name.is_empty() && name[0] == c && matches(&pat[1..], &name[1..]),
+        }
+    }
+    matches(pattern.as_bytes(), path.as_bytes())
+}
+
+/// True if any file under `files` matches any of the globs (empty globs = all).
+pub fn any_glob_matches(root: &Path, globs: &[String], files: &[PathBuf]) -> bool {
+    if globs.is_empty() {
+        return true;
+    }
+    for file in files {
+        let rel = relative_to(root, file);
+        if globs.iter().any(|g| glob_matches(g, &rel)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classify a path by its extension.
+pub fn language_of_path(path: &Path) -> Option<Language> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    if source_extensions(Language::Python).contains(&ext) {
+        Some(Language::Python)
+    } else if source_extensions(Language::Rust).contains(&ext) {
+        Some(Language::Rust)
+    } else if source_extensions(Language::Cpp).contains(&ext) {
+        Some(Language::Cpp)
+    } else {
+        None
+    }
+}
+
+/// Path relative to `root` (falls back to the original path when it is outside).
+pub fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
 /// Tool names we look for per language.
@@ -316,7 +467,7 @@ fn tool_result(tool: &str, found: bool) -> ToolResult {
 /// Render the scan result as a human-readable summary.
 pub fn render(scan: &ScanResult) -> String {
     let mut out = String::new();
-    out.push_str(&format!("codeguard scan: {}\n", scan.path.display()));
+    out.push_str(&format!("codesafe scan: {}\n", scan.path.display()));
     out.push_str(&format!(
         "  languages: {}\n",
         languages_str(&scan.languages)

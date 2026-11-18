@@ -1,6 +1,12 @@
 /target
 /.codeguard/
+/.codesafe/
+**/.codesafe/
 report.md
 report.json
+AGENT_TASK.md
 **/report.md
 **/report.json
+**/AGENT_TASK.md
+__pycache__/
+*.pyc

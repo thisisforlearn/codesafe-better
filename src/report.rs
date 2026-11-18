@@ -21,14 +21,15 @@ pub fn write(path: &Path, report: &Report) -> Result<()> {
 
 pub fn render_md(report: &Report) -> String {
     let mut out = String::new();
-    out.push_str("# codeguard report\n\n");
+    out.push_str("# codesafe report\n\n");
     out.push_str(&format!("Path: {}\n\n", report.path));
     out.push_str("## Summary\n\n");
     out.push_str(&format!(
-        "- tests passed: {}\n- findings: {}\n- benchmarks: {}\n- ai tips: {}\n\n",
+        "- tests passed: {}\n- findings: {}\n- benchmarks: {}\n- optimizations: {}\n- ai tips: {}\n\n",
         report.summary.tests_passed,
         report.summary.findings_total,
         report.summary.benchmarks_total,
+        report.optimizations.len(),
         report.ai_tips.len()
     ));
     out.push_str("## Tool results\n\n");
@@ -87,17 +88,50 @@ pub fn render_md(report: &Report) -> String {
         }
         out.push('\n');
     }
+    out.push_str("## Optimization opportunities\n\n");
+    if report.optimizations.is_empty() {
+        out.push_str("(none)\n\n");
+    } else {
+        out.push_str("| id | category | file:line | symbol | suggested change | gain | risk |\n");
+        out.push_str("|----|----------|-----------|--------|------------------|------|------|\n");
+        for o in &report.optimizations {
+            out.push_str(&format!(
+                "| {} | {} | {}:{} | {} | {} | {} | {} |\n",
+                o.id,
+                o.category,
+                o.file,
+                o.line.map(|l| l.to_string()).unwrap_or_else(|| "-".into()),
+                o.symbol.as_deref().unwrap_or("-"),
+                o.suggested_change.replace('|', "\\|"),
+                o.expected_gain.replace('|', "\\|"),
+                o.risk
+            ));
+        }
+        out.push('\n');
+    }
+
     out.push_str("## AI tips\n\n");
     if report.ai_tips.is_empty() {
         out.push_str("(none)\n\n");
     } else {
         for (i, tip) in report.ai_tips.iter().enumerate() {
             out.push_str(&format!("### Tip {}\n\n", i + 1));
-            out.push_str(&format!("- file: {}\n", tip.file));
+            out.push_str(&format!("- file: {} (folder: {})\n", tip.file, tip.folder));
             out.push_str(&format!("- line: {:?}\n", tip.line));
+            out.push_str(&format!("- symbol: {:?}\n", tip.symbol));
+            out.push_str(&format!("- category: {}\n", tip.category));
             out.push_str(&format!("- change: {}\n", tip.concrete_change));
+            out.push_str(&format!("- impact: {}\n", tip.impact));
+            out.push_str(&format!("- risk: {}\n", tip.risk));
             out.push_str(&format!("- why safe: {}\n", tip.why_safe));
-            out.push_str(&format!("- verify: {}\n\n", tip.how_to_verify));
+            out.push_str(&format!("- verify: {}\n", tip.how_to_verify));
+            if !tip.affected_code.is_empty() {
+                out.push_str("\n```\n");
+                out.push_str(&tip.affected_code);
+                out.push_str("```\n\n");
+            } else {
+                out.push('\n');
+            }
         }
     }
     out
@@ -191,44 +225,94 @@ pub fn finding_from_result(
             fix: None,
             confidence: 0.3,
         }),
+        folder: String::new(),
+        symbol: None,
+        snippet: String::new(),
+        affected_area: None,
+        impact: Some("the reported code path is unreliable until fixed".to_string()),
+        fix_risk: Some("medium: manual change required".to_string()),
     }
 }
 
-/// Build AI-actionable tips from reported findings. Each tip carries enough context
-/// for another AI to apply the change without extra information.
+/// Build AI-actionable tips from reported findings.
 pub fn ai_tips_for(findings: &[Finding]) -> Vec<AiTip> {
+    ai_tips_for_root(None, findings)
+}
+
+/// Build AI-actionable tips enriched with source context (folder, symbol,
+/// affected code, impact and risk) so an agent can act without extra exploration.
+pub fn ai_tips_for_root(root: Option<&Path>, findings: &[Finding]) -> Vec<AiTip> {
     findings
         .iter()
         .filter(|f| f.status != FindingStatus::Fixed)
         .map(|f| {
-            let concrete_change = f
-                .fix
-                .clone()
-                .unwrap_or_else(|| "review the diagnostic and apply a manual fix".to_string());
+            let ctx = match (root, f.file.is_empty()) {
+                (Some(root), false) => crate::context::analyze(root, &f.file, f.line),
+                _ => crate::context::SourceContext::default(),
+            };
+            let file = if f.file.is_empty() { ctx.file.clone() } else { f.file.clone() };
+            let line = f.line.or(ctx.line);
+            let folder = if f.folder.is_empty() { ctx.folder.clone() } else { f.folder.clone() };
+            let symbol = f.symbol.clone().or_else(|| ctx.symbol.clone());
+            let affected_code = if !f.snippet.is_empty() {
+                f.snippet.clone()
+            } else if !ctx.snippet.is_empty() {
+                ctx.snippet.clone()
+            } else {
+                f.context_lines.join("\n")
+            };
+            let concrete_change = f.fix.clone().unwrap_or_else(|| {
+                if let Some(sym) = &symbol {
+                    format!(
+                        "Fix `{sym}` in {file}{}: {}. Change the smallest possible surface.",
+                        line.map(|l| format!(":{l}")).unwrap_or_default(),
+                        f.description
+                    )
+                } else {
+                    format!("Fix the reported issue in {file}: {}", f.description)
+                }
+            });
             let why_safe = if f.fix.is_some() {
                 "the suggested action is the project's own lint/formatter fix; \
-                 it is output-preserving by construction"
+                 it is output-preserving by construction and is verified by build+tests"
                     .to_string()
             } else {
-                "no automatic fix is available for this finding; manual review required".to_string()
+                "no automatic fix is available; constrain the change to the reported symbol and re-run the full suite"
+                    .to_string()
             };
-            let how_to_verify = if f.file.is_empty() {
-                "rerun the failing tool and `codeguard test <path>`; the finding \
-                 should disappear or move to `fixed`"
+            let verification_command = "codesafe test <path>".to_string();
+            let how_to_verify = if file.is_empty() {
+                "rerun the failing tool and `codesafe test <path>`; the finding should disappear or move to `fixed`"
                     .to_string()
             } else {
                 format!(
-                    "apply the change to {}:{:?}, then run `codeguard test <path>` \
-                     and confirm tests still pass",
-                    f.file, f.line
+                    "apply the change to {file}{}, then run `codesafe test <path>` and confirm tests still pass",
+                    line.map(|l| format!(":{l}")).unwrap_or_default()
                 )
             };
+            let impact = f.impact.clone().or_else(|| ctx.affected_area.clone()).unwrap_or_else(|| {
+                "behaviour in this path stays uncertified until the finding is resolved".to_string()
+            });
+            let risk = f.fix_risk.clone().unwrap_or_else(|| {
+                if f.fix.is_some() {
+                    "low: verified automatically".to_string()
+                } else {
+                    "medium: manual change, verify with the full test suite".to_string()
+                }
+            });
             AiTip {
-                file: f.file.clone(),
-                line: f.line,
+                file,
+                line,
                 concrete_change,
                 why_safe,
                 how_to_verify,
+                folder,
+                symbol,
+                affected_code,
+                impact,
+                risk,
+                category: f.category.clone(),
+                verification_command,
             }
         })
         .collect()
@@ -242,7 +326,7 @@ mod tests {
     fn markdown_contains_sections() {
         let report = Report::new(".");
         let md = render_md(&report);
-        assert!(md.contains("# codeguard report"));
+        assert!(md.contains("# codesafe report"));
         assert!(md.contains("## Summary"));
     }
 }

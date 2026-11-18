@@ -24,7 +24,7 @@ impl std::fmt::Display for Language {
 }
 
 /// Finding severity for CI gating (`--fail-on`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
@@ -110,6 +110,31 @@ impl ToolResult {
     pub fn success(&self) -> bool {
         self.exit_code == Some(0)
     }
+
+    /// True for build/test tools, where a non-zero exit means the project is
+    /// broken rather than that a style rule fired.
+    pub fn is_build_or_test(&self) -> bool {
+        let cmd = self.command.to_lowercase();
+        cmd.contains("pytest")
+            || cmd.contains("cargo test")
+            || cmd.contains("cargo build")
+            || cmd.contains("ctest")
+            || cmd.contains("make test")
+            || cmd.contains("nextest")
+            || cmd.contains("compileall")
+            || cmd.contains("cargo clippy")
+    }
+
+    /// Severity of this result, accounting for the tool's semantics.
+    pub fn severity(&self) -> Severity {
+        match self.exit_code {
+            Some(0) => Severity::Info,
+            Some(1) if self.is_build_or_test() => Severity::Error,
+            Some(1) => Severity::Warning,
+            Some(_) => Severity::Error,
+            None => Severity::Critical,
+        }
+    }
 }
 
 impl Default for ToolResult {
@@ -145,6 +170,24 @@ pub struct Finding {
     pub context_lines: Vec<String>,
     pub trace_id: Option<String>,
     pub recovery_hint: Option<RecoveryHint>,
+    /// Directory containing the affected file (relative to the repo root).
+    #[serde(default)]
+    pub folder: String,
+    /// Enclosing function/class/module symbol, when it can be located.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Numbered source snippet around the finding, ready to paste into an LLM prompt.
+    #[serde(default)]
+    pub snippet: String,
+    /// What the affected code is responsible for.
+    #[serde(default)]
+    pub affected_area: Option<String>,
+    /// What breaks if the finding is left unfixed.
+    #[serde(default)]
+    pub impact: Option<String>,
+    /// Risk of fixing it (to avoid "fixing" the code into a worse state).
+    #[serde(default)]
+    pub fix_risk: Option<String>,
 }
 
 /// Recovery hint attached to a finding.
@@ -179,6 +222,12 @@ impl Finding {
             context_lines: Vec::new(),
             trace_id: None,
             recovery_hint: None,
+            folder: String::new(),
+            symbol: None,
+            snippet: String::new(),
+            affected_area: None,
+            impact: None,
+            fix_risk: None,
         }
     }
 }
@@ -201,6 +250,47 @@ pub struct AiTip {
     pub concrete_change: String,
     pub why_safe: String,
     pub how_to_verify: String,
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub affected_code: String,
+    #[serde(default)]
+    pub impact: String,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub verification_command: String,
+}
+
+/// One concrete, verifiable optimization suggestion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Optimization {
+    pub id: String,
+    pub title: String,
+    pub category: String,
+    pub language: Language,
+    pub file: String,
+    #[serde(default)]
+    pub folder: String,
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub evidence: String,
+    #[serde(default)]
+    pub snippet: String,
+    pub explanation: String,
+    pub suggested_change: String,
+    pub expected_gain: String,
+    pub risk: String,
+    pub why_safe: String,
+    pub how_to_apply: String,
+    pub how_to_verify: String,
+    /// 0.0..1.0; higher means higher expected value.
+    pub score: f64,
 }
 
 /// One editable rule.
@@ -212,6 +302,21 @@ pub struct Rule {
     pub action: String,
     pub safety: RuleSafety,
     pub explanation: String,
+    /// Optional glob filter relative to the repository root (e.g. `src/**/*.py`).
+    #[serde(default)]
+    pub globs: Vec<String>,
+    /// Optional list of tools that must be on PATH before the action is applied.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Optional per-rule timeout override in seconds.
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    /// Optional category used in reports (format, lint, security, ...).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Optional severity attached to findings produced by this rule.
+    #[serde(default)]
+    pub severity: Option<Severity>,
 }
 
 /// Aggregated summary of a run.
@@ -239,6 +344,11 @@ pub struct Report {
     pub benchmarks: Vec<BenchmarkResult>,
     pub ai_tips: Vec<AiTip>,
     pub tool_results: Vec<ToolResult>,
+    #[serde(default)]
+    pub optimizations: Vec<Optimization>,
+    /// Structured diagnostics parsed from tool output.
+    #[serde(default)]
+    pub parsed_diagnostics: Vec<crate::diagnostics::ParsedDiagnostic>,
 }
 
 impl Report {
@@ -300,6 +410,25 @@ impl Config {
                 "timeout_s must be at least 1 second".into(),
             ));
         }
+        if let Some(fail_on) = &self.fail_on
+            && fail_on.parse::<Severity>().is_err()
+        {
+            return Err(crate::Error::Config(format!(
+                "invalid fail_on value {fail_on:?}: expected info|warning|error|critical"
+            )));
+        }
+        if let Some(runs) = self.bench_runs
+            && runs == 0
+        {
+            return Err(crate::Error::Config("bench_runs must be at least 1".into()));
+        }
+        if let Some(threshold) = self.regression_threshold_pct
+            && (!threshold.is_finite() || threshold < 0.0)
+        {
+            return Err(crate::Error::Config(
+                "regression_threshold_pct must be a finite non-negative number".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -317,13 +446,26 @@ pub fn hash_file(path: &std::path::Path) -> crate::Result<FileHash> {
 }
 
 /// Hash a directory's relevant files into a single cache key.
+///
+/// Files are sorted first so the hash is stable across platforms and directory
+/// iteration orders. Unreadable files contribute a marker instead of silently
+/// producing an identical hash to an empty file.
 pub fn hash_files(files: &[std::path::PathBuf]) -> crate::Result<FileHash> {
+    let mut sorted: Vec<&std::path::PathBuf> = files.iter().collect();
+    sorted.sort();
     let mut hasher = sha2::Sha256::new();
-    for path in files {
-        if let Ok(bytes) = std::fs::read(path) {
-            hasher.update(&bytes);
-        }
+    for path in sorted {
         hasher.update(path.to_string_lossy().as_bytes());
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            }
+            Err(e) => {
+                hasher.update(b"<unreadable>");
+                hasher.update(e.to_string().as_bytes());
+            }
+        }
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -371,5 +513,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn build_and_test_failures_are_errors_not_warnings() {
+        let mut r = ToolResult {
+            tool: "python3".into(),
+            command: "python3 -m pytest -q".into(),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 1,
+            skipped: false,
+            skip_reason: None,
+        };
+        assert_eq!(r.severity(), Severity::Error);
+        r.command = "cargo test".into();
+        assert_eq!(r.severity(), Severity::Error);
+        r.command = "ruff check .".into();
+        assert_eq!(r.severity(), Severity::Warning);
+        r.exit_code = Some(0);
+        assert_eq!(r.severity(), Severity::Info);
+        r.exit_code = None;
+        assert_eq!(r.severity(), Severity::Critical);
     }
 }

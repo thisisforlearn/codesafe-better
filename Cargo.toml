@@ -1,13 +1,14 @@
 [package]
 name = "codeguard"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "Test, benchmark, profile and safely auto-fix Python, Rust and C++ repositories"
+rust-version = "1.85"
+description = "Verification-first repair and optimization engine for agentic coding across Python, Rust and C++"
 readme = "README.md"
 license = "GPL-3.0-only"
-repository = "https://github.com/sudo-linux-neko/codesafe"
-authors = ["vaibhav <vaibhav@users.noreply.github.com>"]
-keywords = ["codeguard", "lint", "test", "benchmark", "profile", "fix", "rust", "python", "cpp"]
+repository = "https://github.com/thisisforlearn/codesafe-better"
+authors = ["Vaibhav Agarwal"]
+keywords = ["agentic-coding", "static-analysis", "testing", "benchmark", "autofix"]
 categories = ["development-tools::quality", "development-tools::testing"]
 
 [[bin]]
@@ -25,11 +26,11 @@ which = "6"
 thiserror = "1"
 sha2 = "0.10"
 hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

@@ -14,11 +14,15 @@
 pub mod aci;
 pub mod adapters;
 pub mod bench;
+pub mod brief;
+pub mod builtin_rules;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod diagnostics;
 pub mod git;
+pub mod optimizer;
 pub mod orchestration;
 pub mod profile;
 pub mod report;

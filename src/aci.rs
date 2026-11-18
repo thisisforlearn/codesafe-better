@@ -147,12 +147,30 @@ pub fn print_envelope<T: Serialize>(mode: OutputMode, envelope: &Envelope<T>) {
                 }
             }
         }
-        OutputMode::Json => {
-            let _ = serde_json::to_string_pretty(envelope).map(|s| println!("{s}"));
-        }
-        OutputMode::Jsonl => {
-            let _ = serde_json::to_string(envelope).map(|s| println!("{s}"));
-        }
+        OutputMode::Json => match serde_json::to_value(envelope) {
+            Ok(mut value) => {
+                if let Some(meta) = value.get_mut("meta").and_then(|m| m.as_object_mut()) {
+                    meta.insert("output_mode".into(), serde_json::json!(mode.to_string()));
+                }
+                match serde_json::to_string_pretty(&value) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => eprintln!("codesafe: failed to encode response: {e}"),
+                }
+            }
+            Err(e) => eprintln!("codesafe: failed to encode response: {e}"),
+        },
+        OutputMode::Jsonl => match serde_json::to_value(envelope) {
+            Ok(mut value) => {
+                if let Some(meta) = value.get_mut("meta").and_then(|m| m.as_object_mut()) {
+                    meta.insert("output_mode".into(), serde_json::json!(mode.to_string()));
+                }
+                match serde_json::to_string(&value) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => eprintln!("codesafe: failed to encode response: {e}"),
+                }
+            }
+            Err(e) => eprintln!("codesafe: failed to encode response: {e}"),
+        },
     }
 }
 
@@ -194,7 +212,7 @@ mod tests {
             "E001",
             "config",
             "missing config",
-            Some("create codeguard.toml"),
+            Some("create codesafe.toml"),
             true,
             "init",
             Some("."),
@@ -205,7 +223,7 @@ mod tests {
         let err = env.error.unwrap();
         assert_eq!(err.code, "E001");
         assert_eq!(err.category, "config");
-        assert_eq!(err.suggestion, Some("create codeguard.toml".to_string()));
+        assert_eq!(err.suggestion, Some("create codesafe.toml".to_string()));
         assert!(err.is_retryable);
         assert_eq!(err.trace_id, "cs-trace-1");
     }
