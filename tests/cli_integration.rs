@@ -481,6 +481,7 @@ fn mutate_reports_skip_when_no_tool_is_installed() {
     );
 }
 
+#[cfg(unix)]
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
